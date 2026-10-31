@@ -159,7 +159,7 @@ jobs:
         run: |
           set -euo pipefail
           script="scripts/build_rust_mobile.sh"
-          if grep -Fq '"${MOBILE_FLAGS[@]}"' "$script"; then
+          if grep -q '"${MOBILE_FLAGS\[@\]}"$' "$script"; then
             echo "Applying Bash 3.2 empty-array fix to $script"
             python3 - "$script" <<'PY'
           from pathlib import Path
@@ -334,7 +334,8 @@ jobs:
 
           if [ "${#defines[@]}" -gt 0 ]; then
             for define in "${defines[@]}"; do
-              echo "Optional dart-define enabled: ${define#--dart-define=}" | cut -d= -f1
+              key="${define#--dart-define=}"
+              echo "Optional dart-define enabled: ${key%%=*}"
             done
           else
             echo "No optional dart-define set: building with project defaults only."
@@ -351,7 +352,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          APP="$(find apps/forja/build/ios/iphoneos -maxdepth 1 -name '*.app' -print -quit)"
+          APP="$(find apps/forja/build/ios/iphoneos -maxdepth 1 -name '*.app' -print | head -1)"
           if [ -z "$APP" ]; then
             echo "::error::No iOS .app produced under apps/forja/build/ios/iphoneos"
             find apps/forja/build/ios -maxdepth 3 -print 2>/dev/null || true
@@ -438,9 +439,9 @@ jobs:
           unzip -t "$IPA" >/dev/null
           unzip -l "$IPA" | tee "$RUNNER_TEMP/ipa-list.txt"
 
-          grep -qE "Payload/${APP_NAME}\.app/" "$RUNNER_TEMP/ipa-list.txt" \
+          grep -Fq "Payload/${APP_NAME}.app/" "$RUNNER_TEMP/ipa-list.txt" \
             || { echo "::error::IPA has no Payload/${APP_NAME}.app"; exit 1; }
-          grep -q "Payload/${APP_NAME}.app/Frameworks/libffi.dylib" "$RUNNER_TEMP/ipa-list.txt" \
+          grep -Fq "Payload/${APP_NAME}.app/Frameworks/libffi.dylib" "$RUNNER_TEMP/ipa-list.txt" \
             || { echo "::error::IPA is missing the Rust engine"; exit 1; }
 
           rm -rf "$RUNNER_TEMP/ipa-check"
