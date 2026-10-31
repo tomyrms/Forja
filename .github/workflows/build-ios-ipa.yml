@@ -356,10 +356,11 @@ jobs:
             echo "No optional dart-define set: building with project defaults only."
           fi
 
+          # Bash 3.2-safe empty-array expansion (macOS /bin/bash + set -u).
           flutter build ios \
             --release \
             --no-codesign \
-            "${defines[@]}"
+            ${defines[@]+"${defines[@]}"}
 
       - name: Verify .app bundle and embedded Rust engine
         id: app
