@@ -261,6 +261,10 @@ jobs:
           # Full engine (parsers + librqbit torrent + local proxy). Set to 1
           # only if you deliberately want the parser-only variant.
           RUST_MOBILE_PARSER_ONLY: "0"
+          # Without this, cc-rs compiles C deps (aws-lc, ring, quickjs, zstd)
+          # against the iOS 26.5 SDK default while rustc links for the target's
+          # default iOS 10.0, which ends in an undefined ___chkstk_darwin.
+          IPHONEOS_DEPLOYMENT_TARGET: "15.0"
         run: |
           set -euo pipefail
           chmod +x scripts/build_rust_mobile.sh scripts/check_rust_mobile_artifacts.sh
