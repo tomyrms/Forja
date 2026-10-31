@@ -236,6 +236,17 @@ jobs:
           set -euo pipefail
           flutter pub get
 
+          # The Xcode project links plugins through this generated local
+          # package; fail here instead of deep inside xcodebuild if it is
+          # missing.
+          SPM_MANIFEST="ios/Flutter/ephemeral/Packages/FlutterGeneratedPluginSwiftPackage/Package.swift"
+          if [ ! -f "$SPM_MANIFEST" ]; then
+            echo "::error::Missing $SPM_MANIFEST"
+            echo "Swift Package Manager must be enabled before flutter pub get."
+            ls -la ios/Flutter/ephemeral 2>/dev/null || true
+            exit 1
+          fi
+
       - name: CocoaPods install
         working-directory: apps/forja/ios
         shell: bash
