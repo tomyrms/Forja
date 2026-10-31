@@ -56,9 +56,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  APP_SUBDIR: apps/forja
   FLUTTER_VERSION: ${{ inputs.flutter_version }}
-  BUNDLE_ID: ${{ inputs.bundle_id }}
 
   # ---- Optional client / engine configuration -----------------------------
   # Undefined on a fresh fork: all of these resolve to an empty string and the
@@ -270,6 +268,32 @@ jobs:
 
           shasum -a 256 "$DYLIB" | tee "$RUNNER_TEMP/rust-dylib.sha256"
 
+      - name: Apply optional bundle identifier override
+        if: inputs.bundle_id != ''
+        shell: bash
+        env:
+          NEW_BUNDLE_ID: ${{ inputs.bundle_id }}
+        run: |
+          set -euo pipefail
+          case "$NEW_BUNDLE_ID" in
+            *[!A-Za-z0-9.-]*) echo "::error::Invalid bundle_id: '$NEW_BUNDLE_ID'"; exit 1 ;;
+          esac
+
+          # Only the app target's Release configuration. A global
+          # FLUTTER_XCODE_PRODUCT_BUNDLE_IDENTIFIER would also rewrite every
+          # Pod framework's identifier, which is not desirable.
+          PBX="apps/forja/ios/Forja.xcodeproj/project.pbxproj"
+          COUNT="$(grep -c 'PRODUCT_BUNDLE_IDENTIFIER = com\.forjahq\.app;' "$PBX" || true)"
+          if [ "$COUNT" != "1" ]; then
+            echo "::error::Expected exactly one 'com.forjahq.app' Release bundle id, found $COUNT."
+            exit 1
+          fi
+
+          /usr/bin/sed -i '' \
+            "s/PRODUCT_BUNDLE_IDENTIFIER = com\.forjahq\.app;/PRODUCT_BUNDLE_IDENTIFIER = ${NEW_BUNDLE_ID};/" \
+            "$PBX"
+          grep -n 'PRODUCT_BUNDLE_IDENTIFIER' "$PBX"
+
       - name: Build Flutter iOS app (unsigned)
         working-directory: apps/forja
         shell: bash
@@ -281,15 +305,13 @@ jobs:
           # Belt and braces on top of `flutter build ios --no-codesign`.
           FLUTTER_XCODE_CODE_SIGNING_ALLOWED: "NO"
           FLUTTER_XCODE_CODE_SIGNING_REQUIRED: "NO"
+          # Flutter 3.47's Flutter.podspec declares iOS 15.0 as its minimum,
+          # while Forja.xcodeproj still says 13.0 (Xcode 26 supports 15-26).
+          # Override at build time so the final app is coherent; keep 13.0
+          # only if you pin an older Flutter such as 3.44.9.
+          FLUTTER_XCODE_IPHONEOS_DEPLOYMENT_TARGET: "15.0"
         run: |
           set -euo pipefail
-
-          # Only override the bundle ID when the user asked for it. An empty
-          # FLUTTER_XCODE_* value would blank the build setting.
-          if [ -n "${BUNDLE_ID:-}" ]; then
-            export FLUTTER_XCODE_PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID"
-            echo "Bundle identifier override: $BUNDLE_ID"
-          fi
 
           defines=()
           add_define() {
