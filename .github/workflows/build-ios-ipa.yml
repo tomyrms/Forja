@@ -1,0 +1,457 @@
+# Forja — unsigned iOS IPA (manual only)
+#
+# Builds apps/forja for a physical arm64 iPhone/iPad with NO Apple signing
+# material, then packages the .app as Payload/<App>.app inside an unsigned
+# .ipa. Re-sign the artifact yourself with iLoader, SideStore or Sideloadly.
+#
+# No repository secret is required:
+#   - the Rust TMDB client defaults to the public keyless gateway
+#     https://tmdb.forjahq.xyz/3 (see crates/tmdb/src/lib.rs);
+#   - release builds of the Dart client force https://www.forjahq.xyz;
+#   - the Sentry DSN has a public baked-in default;
+#   - every other --dart-define is optional and only enables a feature.
+#
+# Optional repository variables (Settings -> Secrets and variables -> Actions
+# -> Variables) or secrets with the same names are picked up automatically:
+#   SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, RELEASE_CDN_URL, FORJA_WEB_URL,
+#   SENTRY_DSN, POSTHOG_API_KEY, POSTHOG_HOST, SIMKL_CLIENT_ID,
+#   TMDB_API_KEY, TMDB_READ_ACCESS_TOKEN, WYZIE_API_KEY, REDDIT_CLIENT_IDS,
+#   TMDB_BASE_URL
+# Empty values are never forwarded, so built-in defaults stay in effect.
+#
+# Never add Apple certificates, .p12, provisioning profiles or App Store
+# Connect credentials here: this workflow intentionally produces an UNSIGNED
+# IPA and does not touch codesigning.
+name: Build iOS IPA (unsigned)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or commit to build (empty = repository default branch)"
+        required: false
+        type: string
+        default: ""
+      sync_upstream:
+        description: "Fetch mGhassen/Forja and prefer upstream content when the ref exists there"
+        required: false
+        type: boolean
+        default: false
+      bundle_id:
+        description: "Optional bundle identifier override (empty = project value com.forjahq.app)"
+        required: false
+        type: string
+        default: ""
+      flutter_version:
+        description: "Flutter SDK version (this project needs >= 3.44.0)"
+        required: false
+        type: string
+        default: "3.47.9"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP_SUBDIR: apps/forja
+  FLUTTER_VERSION: ${{ inputs.flutter_version }}
+  BUNDLE_ID: ${{ inputs.bundle_id }}
+
+  # ---- Optional client / engine configuration -----------------------------
+  # Undefined on a fresh fork: all of these resolve to an empty string and the
+  # build still succeeds with the project defaults.
+  SUPABASE_URL: ${{ vars.SUPABASE_URL || secrets.SUPABASE_URL }}
+  SUPABASE_PUBLISHABLE_KEY: ${{ vars.SUPABASE_PUBLISHABLE_KEY || secrets.SUPABASE_PUBLISHABLE_KEY || secrets.SUPABASE_ANON_KEY }}
+  RELEASE_CDN_URL: ${{ vars.RELEASE_CDN_URL || secrets.RELEASE_CDN_URL }}
+  FORJA_WEB_URL: ${{ vars.FORJA_WEB_URL || secrets.FORJA_WEB_URL }}
+  SENTRY_DSN: ${{ vars.SENTRY_DSN || secrets.SENTRY_DSN }}
+  POSTHOG_API_KEY: ${{ vars.POSTHOG_API_KEY || secrets.POSTHOG_API_KEY }}
+  POSTHOG_HOST: ${{ vars.POSTHOG_HOST || secrets.POSTHOG_HOST }}
+  SIMKL_CLIENT_ID: ${{ vars.SIMKL_CLIENT_ID || secrets.SIMKL_CLIENT_ID }}
+
+  # Rust compile-time variables (baked into libffi.dylib by build.rs).
+  # Empty values are skipped by crates/tmdb/build_dotenv.rs.
+  TMDB_API_KEY: ${{ vars.TMDB_API_KEY || secrets.TMDB_API_KEY }}
+  TMDB_READ_ACCESS_TOKEN: ${{ vars.TMDB_READ_ACCESS_TOKEN || secrets.TMDB_READ_ACCESS_TOKEN }}
+  TMDB_BASE_URL: ${{ vars.TMDB_BASE_URL || secrets.TMDB_BASE_URL }}
+  WYZIE_API_KEY: ${{ vars.WYZIE_API_KEY || secrets.WYZIE_API_KEY }}
+  REDDIT_CLIENT_IDS: ${{ vars.REDDIT_CLIENT_IDS || secrets.REDDIT_CLIENT_IDS }}
+
+jobs:
+  build-ipa:
+    name: iOS arm64 (unsigned)
+    # arm64 macOS 26 image, same family used by the upstream release workflow.
+    # Pinned Flutter 3.47.9 ships Dart 3.13.x, which satisfies the app lock
+    # (dart >= 3.12.0, flutter >= 3.44.0).
+    runs-on: macos-26
+    timeout-minutes: 150
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve source revision
+        id: source
+        shell: bash
+        env:
+          TARGET_REF: ${{ inputs.ref }}
+          SYNC_UPSTREAM: ${{ inputs.sync_upstream }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          ref="${TARGET_REF:-$DEFAULT_BRANCH}"
+          echo "Requested ref: $ref"
+
+          git fetch --prune --tags origin '+refs/heads/*:refs/remotes/origin/*'
+
+          if [ "$SYNC_UPSTREAM" = "true" ]; then
+            git remote add upstream https://github.com/mGhassen/Forja.git 2>/dev/null \
+              || git remote set-url upstream https://github.com/mGhassen/Forja.git
+            git fetch --prune --tags upstream '+refs/heads/*:refs/remotes/upstream/*'
+          fi
+
+          candidates=()
+          if [ "$SYNC_UPSTREAM" = "true" ]; then
+            candidates+=("upstream/$ref")
+          fi
+          candidates+=("origin/$ref" "$ref")
+
+          target=""
+          for candidate in "${candidates[@]}"; do
+            if git rev-parse --verify --quiet "${candidate}^{commit}" >/dev/null; then
+              target="$candidate"
+              break
+            fi
+          done
+
+          if [ -z "$target" ]; then
+            echo "::error::ref '$ref' was not found in this fork or in mGhassen/Forja."
+            exit 1
+          fi
+
+          git checkout --force -B ci-build "$target"
+          echo "Building $target -> $(git rev-parse HEAD)"
+
+          version="$(awk '/^version:/{print $2; exit}' apps/forja/pubspec.yaml)"
+          version_safe="${version//+/-}"
+          short_sha="$(git rev-parse --short=12 HEAD)"
+
+          {
+            echo "ref=$ref"
+            echo "target=$target"
+            echo "sha=$(git rev-parse HEAD)"
+            echo "short_sha=$short_sha"
+            echo "version=$version"
+            echo "version_safe=$version_safe"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Toolchain information
+        shell: bash
+        run: |
+          set -euo pipefail
+          sw_vers
+          xcodebuild -version
+          echo "iPhoneOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "Xcode path: $(xcode-select -p)"
+          df -h /
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          architecture: arm64
+          cache: true
+
+      - name: Flutter / Dart versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter --version
+          dart --version
+          flutter precache --ios
+
+      - name: Enable Swift Package Manager
+        shell: bash
+        # This project is a hybrid: only 5 plugins are still CocoaPods pods
+        # (Podfile.lock), the rest are linked through the generated Swift
+        # package (Forja.xcodeproj/.../FlutterGeneratedPluginSwiftPackage).
+        # With SPM disabled the registrant would reference unbuilt plugins.
+        run: |
+          set -euo pipefail
+          flutter config --enable-swift-package-manager
+          flutter config --list
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Install Melos
+        shell: bash
+        run: |
+          set -euo pipefail
+          dart pub global activate melos 6.3.0
+          echo "$HOME/.pub-cache/bin" >> "$GITHUB_PATH"
+
+      - name: Bootstrap monorepo
+        shell: bash
+        run: |
+          set -euo pipefail
+          melos bootstrap
+
+      - name: Flutter dependencies
+        working-directory: apps/forja
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter pub get
+
+      - name: CocoaPods install
+        working-directory: apps/forja/ios
+        shell: bash
+        run: |
+          set -euo pipefail
+          pod --version
+          pod install
+
+      - name: Build Rust engine for iOS (arm64)
+        shell: bash
+        env:
+          # Full engine (parsers + librqbit torrent + local proxy). Set to 1
+          # only if you deliberately want the parser-only variant.
+          RUST_MOBILE_PARSER_ONLY: "0"
+        run: |
+          set -euo pipefail
+          chmod +x scripts/build_rust_mobile.sh scripts/check_rust_mobile_artifacts.sh
+          ./scripts/build_rust_mobile.sh ios
+          ./scripts/check_rust_mobile_artifacts.sh ios
+
+          DYLIB="apps/forja/ios/Runner/Frameworks/libffi.dylib"
+          test -f "crates/target/aarch64-apple-ios/release/libffi.dylib"
+          test -f "$DYLIB"
+
+          file "$DYLIB"
+          lipo -info "$DYLIB"
+          lipo -info "$DYLIB" | grep -q 'arm64'
+          echo "Install name:"
+          otool -D "$DYLIB" || true
+
+          shasum -a 256 "$DYLIB" | tee "$RUNNER_TEMP/rust-dylib.sha256"
+
+      - name: Build Flutter iOS app (unsigned)
+        working-directory: apps/forja
+        shell: bash
+        env:
+          # The Rust engine was built and verified in the previous step; skip
+          # the Xcode build phase that would rebuild it (supported escape
+          # hatch in apps/forja/ios/build_rust_ios.sh).
+          BUILD_RUST_IOS: "0"
+          # Belt and braces on top of `flutter build ios --no-codesign`.
+          FLUTTER_XCODE_CODE_SIGNING_ALLOWED: "NO"
+          FLUTTER_XCODE_CODE_SIGNING_REQUIRED: "NO"
+        run: |
+          set -euo pipefail
+
+          # Only override the bundle ID when the user asked for it. An empty
+          # FLUTTER_XCODE_* value would blank the build setting.
+          if [ -n "${BUNDLE_ID:-}" ]; then
+            export FLUTTER_XCODE_PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID"
+            echo "Bundle identifier override: $BUNDLE_ID"
+          fi
+
+          defines=()
+          add_define() {
+            local key="$1"
+            local value="${2:-}"
+            if [ -n "$value" ]; then
+              defines+=("--dart-define=$key=$value")
+            fi
+          }
+
+          add_define SUPABASE_URL "${SUPABASE_URL:-}"
+          add_define SUPABASE_PUBLISHABLE_KEY "${SUPABASE_PUBLISHABLE_KEY:-}"
+          add_define RELEASE_CDN_URL "${RELEASE_CDN_URL:-}"
+          add_define FORJA_WEB_URL "${FORJA_WEB_URL:-}"
+          add_define SENTRY_DSN "${SENTRY_DSN:-}"
+          add_define POSTHOG_API_KEY "${POSTHOG_API_KEY:-}"
+          add_define POSTHOG_HOST "${POSTHOG_HOST:-}"
+          add_define SIMKL_CLIENT_ID "${SIMKL_CLIENT_ID:-}"
+          add_define TMDB_API_KEY "${TMDB_API_KEY:-}"
+
+          if [ "${#defines[@]}" -gt 0 ]; then
+            for define in "${defines[@]}"; do
+              echo "Optional dart-define enabled: ${define#--dart-define=}" | cut -d= -f1
+            done
+          else
+            echo "No optional dart-define set: building with project defaults only."
+          fi
+
+          flutter build ios \
+            --release \
+            --no-codesign \
+            "${defines[@]}"
+
+      - name: Verify .app bundle and embedded Rust engine
+        id: app
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP="$(find apps/forja/build/ios/iphoneos -maxdepth 1 -name '*.app' -print -quit)"
+          if [ -z "$APP" ]; then
+            echo "::error::No iOS .app produced under apps/forja/build/ios/iphoneos"
+            find apps/forja/build/ios -maxdepth 3 -print 2>/dev/null || true
+            exit 1
+          fi
+
+          APP_NAME="$(basename "$APP" .app)"
+          echo "App bundle: $APP"
+
+          PLIST="$APP/Info.plist"
+          test -f "$PLIST"
+          BUNDLE_ID_BUILT="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST")"
+          EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PLIST")"
+          echo "CFBundleIdentifier: $BUNDLE_ID_BUILT"
+          echo "CFBundleExecutable: $EXECUTABLE"
+          echo "CFBundleShortVersionString: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")"
+          echo "CFBundleVersion: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PLIST")"
+          echo "MinimumOSVersion: $(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$PLIST" 2>/dev/null || echo 'not set')"
+
+          test -f "$APP/$EXECUTABLE"
+          test -x "$APP/$EXECUTABLE"
+
+          RUST_DYLIB="$APP/Frameworks/libffi.dylib"
+          if [ ! -f "$RUST_DYLIB" ]; then
+            echo "::error::Rust engine missing: $RUST_DYLIB"
+            echo "Contents of $APP/Frameworks:"
+            ls -la "$APP/Frameworks" 2>/dev/null || true
+            exit 1
+          fi
+
+          file "$RUST_DYLIB"
+          lipo -info "$RUST_DYLIB"
+          lipo -info "$RUST_DYLIB" | grep -q 'arm64'
+
+          EXPECTED="$(cut -d' ' -f1 "$RUNNER_TEMP/rust-dylib.sha256")"
+          ACTUAL="$(shasum -a 256 "$RUST_DYLIB" | cut -d' ' -f1)"
+          if [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "::error::Embedded libffi.dylib ($ACTUAL) differs from the built engine ($EXPECTED)"
+            exit 1
+          fi
+          echo "Embedded Rust engine matches the freshly built arm64 dylib."
+
+          if [ -e "$APP/embedded.mobileprovision" ]; then
+            echo "::error::embedded.mobileprovision found: this build must stay unsigned."
+            exit 1
+          fi
+          echo "No embedded.mobileprovision (unsigned build as expected)."
+
+          if codesign -dv "$APP" >/dev/null 2>&1; then
+            echo "::warning::The app bundle carries a code signature; expected an unsigned build."
+          else
+            echo "App bundle is not code signed."
+          fi
+
+          {
+            echo "app=$APP"
+            echo "app_name=$APP_NAME"
+            echo "bundle_id=$BUNDLE_ID_BUILT"
+            echo "executable=$EXECUTABLE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Package unsigned IPA
+        id: ipa
+        shell: bash
+        env:
+          APP_PATH: ${{ steps.app.outputs.app }}
+          APP_NAME: ${{ steps.app.outputs.app_name }}
+          VERSION_SAFE: ${{ steps.source.outputs.version_safe }}
+          SHORT_SHA: ${{ steps.source.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+
+          rm -rf Payload dist
+          mkdir -p Payload dist
+
+          cp -R "$APP_PATH" Payload/
+          test -d "Payload/${APP_NAME}.app"
+
+          IPA="dist/Forja-${VERSION_SAFE}-unsigned-${SHORT_SHA}.ipa"
+          # ditto preserves executable bits and symlinks, unlike zip -r.
+          ditto -c -k --sequesterRsrc --keepParent Payload "$IPA"
+
+          # ---- structural verification before publishing -------------------
+          unzip -t "$IPA" >/dev/null
+          unzip -l "$IPA" | tee "$RUNNER_TEMP/ipa-list.txt"
+
+          grep -qE "Payload/${APP_NAME}\.app/" "$RUNNER_TEMP/ipa-list.txt" \
+            || { echo "::error::IPA has no Payload/${APP_NAME}.app"; exit 1; }
+          grep -q "Payload/${APP_NAME}.app/Frameworks/libffi.dylib" "$RUNNER_TEMP/ipa-list.txt" \
+            || { echo "::error::IPA is missing the Rust engine"; exit 1; }
+
+          rm -rf "$RUNNER_TEMP/ipa-check"
+          mkdir -p "$RUNNER_TEMP/ipa-check"
+          ditto -x -k "$IPA" "$RUNNER_TEMP/ipa-check"
+
+          CHECK_APP="$RUNNER_TEMP/ipa-check/Payload/${APP_NAME}.app"
+          test -f "$CHECK_APP/Info.plist"
+          CHECK_EXE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$CHECK_APP/Info.plist")"
+          test -x "$CHECK_APP/$CHECK_EXE"
+          test -f "$CHECK_APP/Frameworks/libffi.dylib"
+
+          rm -rf Payload
+
+          SIZE="$(du -h "$IPA" | cut -f1)"
+          SHA="$(shasum -a 256 "$IPA" | cut -d' ' -f1)"
+          echo "IPA: $IPA ($SIZE)"
+          echo "SHA256: $SHA"
+
+          {
+            echo "path=$IPA"
+            echo "size=$SIZE"
+            echo "sha256=$SHA"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Forja-iOS-unsigned-${{ steps.source.outputs.version_safe }}-${{ steps.source.outputs.short_sha }}
+          path: ${{ steps.ipa.outputs.path }}
+          if-no-files-found: error
+          retention-days: 14
+          # An IPA is already compressed; skip another compression pass.
+          compression-level: 0
+
+      - name: Build summary
+        shell: bash
+        env:
+          IPA_PATH: ${{ steps.ipa.outputs.path }}
+          IPA_SIZE: ${{ steps.ipa.outputs.size }}
+          IPA_SHA: ${{ steps.ipa.outputs.sha256 }}
+          BUNDLE_ID_BUILT: ${{ steps.app.outputs.bundle_id }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Forja iOS — unsigned IPA"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Source | \`${{ steps.source.outputs.target }}\` |"
+            echo "| Commit | \`${{ steps.source.outputs.sha }}\` |"
+            echo "| App version | \`${{ steps.source.outputs.version }}\` |"
+            echo "| Bundle ID | \`${BUNDLE_ID_BUILT}\` |"
+            echo "| Flutter | \`${{ env.FLUTTER_VERSION }}\` |"
+            echo "| Xcode | \`$(xcodebuild -version | head -1)\` |"
+            echo "| IPA | \`$(basename "$IPA_PATH")\` (${IPA_SIZE}) |"
+            echo "| SHA256 | \`${IPA_SHA}\` |"
+            echo ""
+            echo "Unsigned build: re-sign it with iLoader, SideStore or Sideloadly."
+          } >> "$GITHUB_STEP_SUMMARY"
