@@ -152,6 +152,30 @@ jobs:
             echo "version_safe=$version_safe"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Keep the Rust script compatible with macOS Bash 3.2
+        shell: bash
+        # GitHub's macOS images only provide Bash 3.2.57, where expanding an
+        # empty array with "${arr[@]}" aborts under `set -u`. The branch this
+        # workflow lives on carries the one-line fix, but `sync_upstream`
+        # builds upstream commits that may not; patch the working copy only.
+        run: |
+          set -euo pipefail
+          script="scripts/build_rust_mobile.sh"
+          if grep -Fq '"${MOBILE_FLAGS[@]}"' "$script"; then
+            echo "Applying Bash 3.2 empty-array fix to $script"
+            python3 - "$script" <<'PY'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          text = path.read_text()
+          old = '"${MOBILE_FLAGS[@]}"'
+          new = '${MOBILE_FLAGS[@]+"${MOBILE_FLAGS[@]}"}'
+          path.write_text(text.replace(old, new))
+          PY
+          fi
+          grep -n 'MOBILE_FLAGS' "$script"
+
       - name: Toolchain information
         shell: bash
         run: |

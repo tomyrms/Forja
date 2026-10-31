@@ -21,7 +21,8 @@ fi
 build_ios() {
   echo "==> iOS arm64"
   rustup target add aarch64-apple-ios >/dev/null 2>&1 || true
-  cargo build -p ffi --target aarch64-apple-ios "--$PROFILE" "${MOBILE_FLAGS[@]}"
+  # Bash 3.2 (macOS /bin/bash) treats an empty array as unset under `set -u`.
+  cargo build -p ffi --target aarch64-apple-ios "--$PROFILE" ${MOBILE_FLAGS[@]+"${MOBILE_FLAGS[@]}"}
   local out="$ROOT/crates/target/aarch64-apple-ios/$PROFILE/libffi.dylib"
   local dest="$ROOT/apps/forja/ios/Runner/Frameworks"
   mkdir -p "$dest"
